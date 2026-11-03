@@ -1,0 +1,8 @@
+__pycache__
+*.pyc
+.git
+.venv
+*.ipynb
+README.md
+nexvoy_cli.py
+test_recommendations.py

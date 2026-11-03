@@ -1,0 +1,63 @@
+{
+  "model_name": "SVM (RBF)",
+  "best_params": {
+    "model__C": 10,
+    "model__gamma": 0.01
+  },
+  "target": "budget_level",
+  "label_names": [
+    "Budget",
+    "Luxury",
+    "Mid-range"
+  ],
+  "numeric_cols": [
+    "culture",
+    "adventure",
+    "nature",
+    "beaches",
+    "nightlife",
+    "cuisine",
+    "wellness",
+    "urban",
+    "seclusion",
+    "avg_temp",
+    "temp_std",
+    "cost_of_living_index",
+    "tourist_infra_score"
+  ],
+  "categorical_cols": [
+    "region"
+  ],
+  "feature_cols": [
+    "culture",
+    "adventure",
+    "nature",
+    "beaches",
+    "nightlife",
+    "cuisine",
+    "wellness",
+    "urban",
+    "seclusion",
+    "avg_temp",
+    "temp_std",
+    "cost_of_living_index",
+    "tourist_infra_score",
+    "region"
+  ],
+  "known_regions": [
+    "africa",
+    "asia",
+    "europe",
+    "middle_east",
+    "north_america",
+    "oceania",
+    "south_america"
+  ],
+  "cv_f1_macro": 0.8788,
+  "test_metrics": {
+    "accuracy": 0.8947,
+    "f1_macro": 0.8859,
+    "balanced_accuracy": 0.9287
+  },
+  "sklearn_version": "1.6.1"
+}
