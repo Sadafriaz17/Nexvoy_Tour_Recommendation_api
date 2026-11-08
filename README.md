@@ -139,7 +139,7 @@ the origins.
 }
 ```
 
-`region` is optional. `budget` is Budget, Mid-range or Luxury. Ratings are whole numbers from 1 to 5. `top_n` is 1 to 10.
+`region` is optional. `budget` is Budget, Mid-range or Luxury. Ratings are whole numbers from 1 to 5. `top_n` is 1 to 10. `travel_month` (1–12) remains optional. For forecast-based ranking, send both `travel_start_date` and `travel_end_date` as `YYYY-MM-DD`.
 The reply has `predicted_budget`, `selected_budget`, `notes`, `region_applied`, and a `results` list. Each result has
 `rank`, `city`, `country`, `region`, `budget_level`, `avg_hotel_usd`, `avg_temp`, `ideal_trip_days`,
 `ideal_trip_labels`, `match_score`, `preference_match`, `temperature_match`, `budget_confidence` and `description`.
@@ -164,3 +164,50 @@ The property names in the reply are lower case with underscores (for example `ma
 - **Run it on your own machine.** Docker Desktop as above. Free, and enough for a final-year project demo.
 
 Check each provider's current terms before relying on them; free tiers change often.
+
+
+## Weather data from Open-Meteo (version 2.3)
+
+The temperature match can now use real monthly temperatures from the Open-Meteo Historical Weather API (ERA5 data), and an optional travel month.
+
+**Travel month.** `POST /recommend` accepts an optional `"travel_month"` (1 to 12). When it is sent, the temperature match uses that month only. When it is missing, all 12 months are used, exactly as before. Each result then also has `month_temp` and `temperature_source`.
+
+**Climate file.** `build_climate.py` makes `city_climate_era5.csv`. If this file sits next to `app.py`, its values replace the dataset's monthly temperatures for the temperature match. If it is missing, the API works exactly as before. The model's own inputs (`avg_temp`, `temp_std`) are never changed.
+
+```
+pip install requests pandas numpy
+python build_climate.py --check       # one small request, tests the connection
+python build_climate.py --limit 10    # fetch 10 cities and compare them with the dataset
+python build_climate.py               # fetch as many cities as today's budget allows
+```
+
+The free Open-Meteo plan allows 10,000 calls per day, so the full dataset takes about 10 days. The script can be stopped and run again at any time. Deploy only when it reports that everything is finished. The free plan is for non-commercial use and needs credit to Open-Meteo.com.
+
+
+### 16-day trip forecast
+
+`POST /recommend` also accepts optional `travel_start_date` and `travel_end_date` values in `YYYY-MM-DD` format.
+Provide both dates together. If the **entire trip** fits inside Open-Meteo's next 16 forecast days, the API requests daily
+mean/minimum/maximum temperature, maximum precipitation probability, and weather code for a shortlist of up to 50
+candidate destinations. The temperature part of the ranking uses the average daily mean temperature across the trip;
+the existing 65% preference / 35% temperature weights remain unchanged. The saved SVM and its input features are not
+modified or retrained.
+
+Example request additions:
+
+```json
+{
+  "travel_start_date": "2026-11-12",
+  "travel_end_date": "2026-11-16"
+}
+```
+
+When the dates are outside the 16-day window, cross its boundary, or Open-Meteo is unavailable or returns incomplete
+data, the API falls back to the existing monthly climate method for the **whole recommendation request**. It does not
+mix forecast and monthly-climate scores in one ranking. The response includes `weather_source` (`open_meteo_forecast`
+or `monthly_climate`), the requested dates, and `forecast_candidates_evaluated`. Forecast-backed results also include
+`forecast_avg_temp`, `forecast_precipitation_probability_max`, `forecast_weather_code`, and a
+`temperature_source` label. If no dates are supplied, existing behavior is unchanged.
+
+The free Open-Meteo Forecast endpoint does not require an API key for non-commercial use. Do not add an API key to
+`.env`, Docker, or ASP.NET for this endpoint. Check Open-Meteo's current terms before using it commercially.

@@ -8,12 +8,21 @@
 #                 The trained model is NOT used for ranking.
 #   * MODEL     = the saved scikit-learn pipeline (an SVM with RBF kernel). It estimates which budget
 #                 class a destination belongs to. It feeds "predicted_budget" and "budget_confidence".
+#   * CLIMATE   = (v2.2) the monthly temperatures used for the temperature match. If city_climate_era5.csv
+#                 exists (made by build_climate.py from the Open-Meteo Historical Weather API), those values
+#                 are used. Otherwise the dataset's own monthly values are used, exactly as before.
+#                 The model's own inputs (avg_temp, temp_std) are NOT changed, so the model stays intact.
+#   * MONTH     = (v2.2) an optional "travel_month" (1 to 12). When it is sent, the temperature match uses
+#                 that month only. When it is missing, all 12 months are used, exactly as before.
 import json
 import logging
 import os
 import secrets
 import unicodedata
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
+
+import requests
 
 import joblib
 import numpy as np
@@ -22,7 +31,7 @@ import sklearn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 log = logging.getLogger("nexvoy")
 logging.basicConfig(level=logging.INFO)
@@ -34,11 +43,15 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "nexvoy_model.pkl")
 INFO_PATH = os.path.join(BASE_DIR, "nexvoy_model_info.json")
 DATA_PATH = os.path.join(BASE_DIR, "Worldwide_Travel_Cities_FIXED.csv")
+CLIMATE_PATH = os.path.join(BASE_DIR, "city_climate_era5.csv")   # made by build_climate.py (optional)
 
 # How the final compatibility score is built (both parts are similarities from 0 to 1).
 WEIGHT_PREFERENCES = 0.65   # how close the city is to the user's 9 ratings
 WEIGHT_TEMPERATURE = 0.35   # how close the city's temperature is to the wanted temperature
 TEMP_DECAY_C = 12.0         # a month this many degrees away keeps about 37 percent of the temperature score
+FORECAST_DAYS = 16
+FORECAST_SHORTLIST_SIZE = 50  # shortlist before querying Open-Meteo, rather than querying every dataset city
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 PROFILE_SIZE = 10           # best matching cities used for the model's budget estimate
 MIN_REGION_RESULTS = 3      # fewer matches than this in the chosen region means all regions are shown
 
@@ -50,6 +63,9 @@ TEMPERATURE_METHOD = "monthly"
 
 PREF_COLS = ["culture", "adventure", "nature", "beaches", "nightlife",
              "cuisine", "wellness", "urban", "seclusion"]
+
+MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+               "July", "August", "September", "October", "November", "December"]
 
 # Optional protection. If NEXVOY_API_KEY is set, calls must send it in the X-API-Key header.
 API_KEY = os.environ.get("NEXVOY_API_KEY", "")
@@ -122,6 +138,58 @@ def monthly_averages(raw) -> List[float]:
         return []
 
 
+def monthly_by_month(raw) -> np.ndarray:
+    """12 numbers, one per calendar month (January first). A missing month is NaN.
+    The dataset stores months as "1" to "12"; month names such as "January" also work."""
+    out = np.full(12, np.nan)
+    if not isinstance(raw, str):
+        return out
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return out
+    if not isinstance(data, dict):
+        return out
+    for i, name in enumerate(MONTH_NAMES):
+        entry = data.get(str(i + 1), data.get(name))
+        value = pd.to_numeric(entry.get("avg") if isinstance(entry, dict) else entry, errors="coerce")
+        if pd.notna(value):
+            out[i] = float(value)
+    return out
+
+
+def climate_key(lat, lon) -> str:
+    # Must match make_key() in build_climate.py.
+    return f"{float(lat):.3f},{float(lon):.3f}"
+
+
+def merge_climate(df: pd.DataFrame, dataset_months: np.ndarray):
+    """Use Open-Meteo values where city_climate_era5.csv has them, the dataset's own values elsewhere.
+    Returns (n cities x 12 array, one source label per city, label for the health page)."""
+    sources = np.array(["Dataset"] * len(df), dtype=object)
+    if not os.path.exists(CLIMATE_PATH):
+        return dataset_months, sources, "Dataset (no Open-Meteo file found)"
+    clim = pd.read_csv(CLIMATE_PATH, dtype={"key": str})
+    month_cols = [f"m{i}" for i in range(1, 13)]
+    clim = clim.dropna(subset=month_cols)
+    table = {str(k): row.astype(float) for k, row in zip(clim["key"], clim[month_cols].to_numpy())}
+    years = str(clim["years"].iloc[0]) if len(clim) else ""
+    label = f"Open-Meteo ERA5, {years}" if years else "Open-Meteo ERA5"
+
+    merged = dataset_months.copy()
+    for i, (lat, lon) in enumerate(zip(df["latitude"], df["longitude"])):
+        values = table.get(climate_key(lat, lon))
+        if values is not None:
+            merged[i] = values
+            sources[i] = label
+    covered = int((sources != "Dataset").sum())
+    if covered < len(df):
+        log.warning("Open-Meteo climate covers only %d of %d destinations. Run build_climate.py until it "
+                    "reports that everything is finished, so every city is scored the same way.",
+                    covered, len(df))
+    return merged, sources, f"{label} ({covered} of {len(df)} destinations)"
+
+
 def plain_text(text: str) -> str:
     text = unicodedata.normalize("NFKD", str(text))
     return "".join(c for c in text if not unicodedata.combining(c)).lower().strip()
@@ -153,11 +221,12 @@ def load_destinations() -> Tuple[pd.DataFrame, np.ndarray]:
     # A city without ratings or temperature cannot be compared, so it is left out.
     df = df.dropna(subset=PREF_COLS + ["avg_temp"]).reset_index(drop=True)
 
-    # One row per city, one column per month (shorter lists are padded with NaN and ignored).
-    width = max(len(v) for v in df["_monthly"])
-    monthly = np.full((len(df), width), np.nan)
-    for i, values in enumerate(df["_monthly"]):
-        monthly[i, :len(values)] = values
+    # One row per city, one column per calendar month (column 0 = January). The model above keeps using
+    # the dataset's own avg_temp and temp_std. Only the temperature MATCH uses the Open-Meteo values.
+    dataset_months = np.vstack([monthly_by_month(raw) for raw in df["avg_temp_monthly"]])
+    monthly, sources, climate_label = merge_climate(df, dataset_months)
+    df["clim_avg"] = np.nanmean(monthly, axis=1)     # yearly average used for display and "yearly" mode
+    df["temp_source"] = sources
     df = df.drop(columns="_monthly")
 
     durations = df["ideal_durations"].apply(parse_duration)
@@ -168,19 +237,19 @@ def load_destinations() -> Tuple[pd.DataFrame, np.ndarray]:
     proba = PIPELINE.predict_proba(df[FEATURE_COLS])
     for i, cls in enumerate(PIPELINE.classes_):
         df[f"proba_{cls}"] = proba[:, i]
-    return df, monthly
+    return df, monthly, climate_label
 
 
-DEST, MONTHLY = load_destinations()
+DEST, MONTHLY, CLIMATE_LABEL = load_destinations()
 if DEST.empty:
     raise RuntimeError("No usable destinations were found in the dataset.")
-log.info("Loaded %d destinations. Model: %s. Temperature method: %s",
-         len(DEST), MODEL_NAME, TEMPERATURE_METHOD)
+log.info("Loaded %d destinations. Model: %s. Temperature method: %s. Climate: %s",
+         len(DEST), MODEL_NAME, TEMPERATURE_METHOD, CLIMATE_LABEL)
 
 # ----------------------------------------------------------------------------
 # App, CORS and errors
 # ----------------------------------------------------------------------------
-app = FastAPI(title="NexVoy API", version="2.1")
+app = FastAPI(title="NexVoy API", version="2.3")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -222,6 +291,21 @@ class RecommendRequest(BaseModel):
     region: Optional[str] = Field(default=None, max_length=30, description="Optional region, for example europe")
     preferences: Preferences
     top_n: int = Field(default=5, ge=1, le=10)
+    travel_month: Optional[int] = Field(default=None, ge=1, le=12,
+                                        description="Optional month of travel, 1 = January ... 12 = December")
+    travel_start_date: Optional[date] = Field(default=None, description="First day of the trip (YYYY-MM-DD)")
+    travel_end_date: Optional[date] = Field(default=None, description="Last day of the trip (YYYY-MM-DD)")
+
+    @model_validator(mode="after")
+    def validate_trip_dates(self):
+        if (self.travel_start_date is None) != (self.travel_end_date is None):
+            raise ValueError("Provide both travel_start_date and travel_end_date, or neither.")
+        if self.travel_start_date and self.travel_end_date:
+            if self.travel_end_date < self.travel_start_date:
+                raise ValueError("travel_end_date must be on or after travel_start_date.")
+            if (self.travel_end_date - self.travel_start_date).days > 30:
+                raise ValueError("Trip date range cannot exceed 31 calendar days.")
+        return self
 
 
 class Recommendation(BaseModel):
@@ -239,6 +323,11 @@ class Recommendation(BaseModel):
     temperature_match: float    # similarity of the temperature, 0 to 100
     budget_confidence: float    # model probability that this city is in the selected budget class
     description: str
+    month_temp: Optional[float] = None   # average temperature in the travel month (only when a month is sent)
+    temperature_source: str = ""         # where this city's temperatures come from
+    forecast_avg_temp: Optional[float] = None
+    forecast_precipitation_probability_max: Optional[float] = None
+    forecast_weather_code: Optional[int] = None
 
 
 class RecommendResponse(BaseModel):
@@ -249,6 +338,13 @@ class RecommendResponse(BaseModel):
     predicted_budget_basis: str
     preferred_temperature: float
     region_applied: Optional[str]
+    travel_month: Optional[int] = None
+    travel_month_name: Optional[str] = None
+    travel_start_date: Optional[date] = None
+    travel_end_date: Optional[date] = None
+    weather_source: str = "monthly_climate"
+    forecast_candidates_evaluated: int = 0
+    climate_source: str = ""
     notes: List[str]
     count: int
     results: List[Recommendation]
@@ -319,20 +415,31 @@ def pretty(region: str) -> str:
 # ----------------------------------------------------------------------------
 # Scoring
 # ----------------------------------------------------------------------------
-def temperature_similarity(frame: pd.DataFrame, desired_temp: float) -> np.ndarray:
+def month_temperatures(frame: pd.DataFrame, month: int) -> np.ndarray:
+    """The average temperature of one calendar month (1 to 12) for every city in `frame`.
+    If a city has no value for that month, its yearly average is used instead."""
+    values = MONTHLY[frame.index.to_numpy(), month - 1]
+    return np.where(np.isnan(values), frame["clim_avg"].to_numpy(float), values)
+
+
+def temperature_similarity(frame: pd.DataFrame, desired_temp: float, month: Optional[int] = None) -> np.ndarray:
     """0 to 1 for every city in `frame` (its index labels are positions in DEST / MONTHLY)."""
     positions = frame.index.to_numpy()
+    if month:
+        # The traveller knows when they will go, so compare with that month only.
+        return np.exp(-np.abs(month_temperatures(frame, month) - desired_temp) / TEMP_DECAY_C)
     if TEMPERATURE_METHOD == "monthly":
         gaps = np.abs(MONTHLY[positions] - desired_temp)               # cities x months
         return np.nanmean(np.exp(-gaps / TEMP_DECAY_C), axis=1)       # missing months are ignored
-    return np.exp(-np.abs(frame["avg_temp"].to_numpy(float) - desired_temp) / TEMP_DECAY_C)
+    return np.exp(-np.abs(frame["clim_avg"].to_numpy(float) - desired_temp) / TEMP_DECAY_C)
 
 
-def compatibility(frame: pd.DataFrame, user_ratings: np.ndarray, desired_temp: float):
+def compatibility(frame: pd.DataFrame, user_ratings: np.ndarray, desired_temp: float,
+                  month: Optional[int] = None):
     """Return (preference similarity, temperature similarity, overall score), each from 0 to 1."""
     # Ratings are on a 1 to 5 scale, so the largest possible gap on one rating is 4.
     pref = 1.0 - np.abs(frame[PREF_COLS].to_numpy(float) - user_ratings).mean(axis=1) / 4.0
-    temp = temperature_similarity(frame, desired_temp)
+    temp = temperature_similarity(frame, desired_temp, month)
     overall = WEIGHT_PREFERENCES * pref + WEIGHT_TEMPERATURE * temp
     return pref, temp, overall
 
@@ -340,6 +447,71 @@ def compatibility(frame: pd.DataFrame, user_ratings: np.ndarray, desired_temp: f
 def rank_order(overall: np.ndarray, pref: np.ndarray) -> np.ndarray:
     # Highest score first. Equal scores are ordered by preference similarity.
     return np.lexsort((-pref, -overall))
+
+
+# ----------------------------------------------------------------------------
+# Open-Meteo short-range forecast (does not alter/retrain the saved SVM)
+# ----------------------------------------------------------------------------
+def forecast_window_covers(start: date, end: date) -> bool:
+    """True only when the complete trip fits in the next 16 calendar forecast days."""
+    today = datetime.now(timezone.utc).date()
+    last_day = today + timedelta(days=FORECAST_DAYS - 1)
+    return start >= today and end <= last_day
+
+
+def fetch_trip_forecasts(frame: pd.DataFrame, start: date, end: date) -> Dict[int, dict]:
+    """Fetch one batched Open-Meteo request for a shortlist of city rows.
+
+    Returns a mapping keyed by the original DEST row index. Any network/API/data error
+    is handled by the caller as a monthly-climate fallback.
+    """
+    if frame.empty:
+        return {}
+    coords = frame[["latitude", "longitude"]].apply(pd.to_numeric, errors="coerce")
+    valid = coords.dropna()
+    if valid.empty:
+        return {}
+    # Open-Meteo accepts comma-separated coordinates for multi-location requests.
+    latitudes = ",".join(f"{float(v):.4f}" for v in valid["latitude"])
+    longitudes = ",".join(f"{float(v):.4f}" for v in valid["longitude"])
+    params = {
+        "latitude": latitudes,
+        "longitude": longitudes,
+        "daily": "temperature_2m_mean,temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code",
+        "forecast_days": FORECAST_DAYS,
+        "timezone": ",".join(["auto"] * len(valid)),
+        "temperature_unit": "celsius",
+    }
+    response = requests.get(OPEN_METEO_URL, params=params, timeout=25)
+    response.raise_for_status()
+    payload = response.json()
+    locations = payload if isinstance(payload, list) else [payload]
+    row_indices = list(valid.index)
+    output: Dict[int, dict] = {}
+    for idx, item in zip(row_indices, locations):
+        daily = item.get("daily") or {}
+        dates = daily.get("time") or []
+        means = daily.get("temperature_2m_mean") or []
+        precip = daily.get("precipitation_probability_max") or []
+        codes = daily.get("weather_code") or []
+        selected = [i for i, day in enumerate(dates) if start.isoformat() <= day <= end.isoformat()]
+        temps = [means[i] for i in selected if i < len(means) and means[i] is not None]
+        rain = [precip[i] for i in selected if i < len(precip) and precip[i] is not None]
+        weather_codes = [codes[i] for i in selected if i < len(codes) and codes[i] is not None]
+        expected_days = (end - start).days + 1
+        if len(temps) != expected_days:
+            continue
+        # The maximum daily precipitation probability is a useful trip-level caution signal.
+        output[int(idx)] = {
+            "avg_temp": float(np.mean(temps)),
+            "precipitation_probability_max": float(max(rain)) if rain else None,
+            "weather_code": int(pd.Series(weather_codes).mode().iloc[0]) if weather_codes else None,
+        }
+    if len(output) != len(frame):
+        log.warning("Open-Meteo returned complete trip data for %d of %d shortlisted destinations; using monthly fallback for consistency.",
+                    len(output), len(frame))
+        return {}
+    return output
 
 
 # ----------------------------------------------------------------------------
@@ -362,6 +534,7 @@ def health():
         "labels": LABELS,
         "destinations": int(len(DEST)),
         "temperature_method": TEMPERATURE_METHOD,
+        "climate_source": CLIMATE_LABEL,
         "sklearn_version": sklearn.__version__,
     }
 
@@ -375,8 +548,18 @@ def model_info():
 def recommend(req: RecommendRequest):
     budget = clean_budget(req.budget)
     region = clean_region(req.region)
+    month = req.travel_month
     user_ratings = np.array([getattr(req.preferences, c) for c in PREF_COLS], dtype=float)
     notes: List[str] = []
+    trip_forecasts: Dict[int, dict] = {}
+    weather_source = "monthly_climate"
+    forecast_candidates_evaluated = 0
+    forecast_active = False
+    if req.travel_start_date and req.travel_end_date:
+        if forecast_window_covers(req.travel_start_date, req.travel_end_date):
+            forecast_active = True
+        else:
+            notes.append("The complete trip is outside the 16-day Open-Meteo forecast window. Monthly climate averages were used instead.")
 
     # Step 1: region. Use it only if enough destinations in the chosen budget exist there.
     pool = DEST
@@ -392,7 +575,7 @@ def recommend(req: RecommendRequest):
 
     # Step 2: the model's budget estimate for this user's taste. Rank every city in the pool
     # (all budgets) by compatibility, then average the model's probabilities for the best ones.
-    pref_all, temp_all, overall_all = compatibility(pool, user_ratings, req.temperature)
+    pref_all, temp_all, overall_all = compatibility(pool, user_ratings, req.temperature, month)
     best = rank_order(overall_all, pref_all)[:PROFILE_SIZE]
     mean_proba = {cls: float(pool.iloc[best][f"proba_{cls}"].mean()) for cls in LABELS}
     predicted_budget = max(mean_proba, key=mean_proba.get)
@@ -403,11 +586,37 @@ def recommend(req: RecommendRequest):
     if candidates.empty:
         notes.append(f"No {budget} destinations were found for these filters.")
     else:
-        pref, temp, overall = compatibility(candidates, user_ratings, req.temperature)
+        pref, temp, overall = compatibility(candidates, user_ratings, req.temperature, month)
+        candidate_frame = candidates
+        forecast_scores = None
+        if forecast_active:
+            # First narrow to a manageable group using the existing preference + monthly-climate score.
+            # Then replace temperature similarity with actual trip forecast for those shortlisted cities.
+            shortlist_order = rank_order(overall, pref)[:min(FORECAST_SHORTLIST_SIZE, len(candidates))]
+            shortlist = candidates.iloc[shortlist_order]
+            try:
+                trip_forecasts = fetch_trip_forecasts(shortlist, req.travel_start_date, req.travel_end_date)
+                if trip_forecasts:
+                    forecast_positions = [i for i, row_idx in enumerate(shortlist.index) if row_idx in trip_forecasts]
+                    candidate_frame = shortlist.iloc[forecast_positions]
+                    pref = 1.0 - np.abs(candidate_frame[PREF_COLS].to_numpy(float) - user_ratings).mean(axis=1) / 4.0
+                    forecast_temps = np.array([trip_forecasts[i]["avg_temp"] for i in candidate_frame.index], dtype=float)
+                    forecast_scores = np.exp(-np.abs(forecast_temps - req.temperature) / TEMP_DECAY_C)
+                    overall = WEIGHT_PREFERENCES * pref + WEIGHT_TEMPERATURE * forecast_scores
+                    temp = forecast_scores
+                    forecast_candidates_evaluated = len(candidate_frame)
+                    weather_source = "open_meteo_forecast"
+                else:
+                    notes.append("Open-Meteo did not return usable trip weather. Monthly climate averages were used instead.")
+            except Exception as exc:
+                log.warning("Open-Meteo forecast failed; using monthly climate fallback: %s", exc)
+                notes.append("Open-Meteo was unavailable. Monthly climate averages were used instead.")
         order = rank_order(overall, pref)[: req.top_n]
+        month_values = month_temperatures(candidate_frame, month) if month and weather_source == "monthly_climate" else None
         for position, idx in enumerate(order, start=1):
-            row = candidates.iloc[idx]
+            row = candidate_frame.iloc[idx]
             hotel = row["avg_hotel_usd"]
+            forecast = trip_forecasts.get(candidate_frame.index[idx]) if weather_source == "open_meteo_forecast" else None
             results.append(Recommendation(
                 rank=position,
                 city=str(row["city"]),
@@ -415,7 +624,7 @@ def recommend(req: RecommendRequest):
                 region=pretty(str(row["region"])),
                 budget_level=str(row["budget_level"]),
                 avg_hotel_usd=int(hotel) if pd.notna(hotel) else None,
-                avg_temp=round(float(row["avg_temp"]), 1),
+                avg_temp=round(float(row["clim_avg"]), 1),
                 ideal_trip_days=str(row["trip_days"]),
                 ideal_trip_labels=str(row["trip_labels"]),
                 match_score=round(float(overall[idx]) * 100, 1),
@@ -423,6 +632,11 @@ def recommend(req: RecommendRequest):
                 temperature_match=round(float(temp[idx]) * 100, 1),
                 budget_confidence=round(float(row[f"proba_{budget}"]) * 100, 1),
                 description=str(row["short_description"]) if pd.notna(row.get("short_description")) else "",
+                month_temp=round(float(month_values[idx]), 1) if month_values is not None else None,
+                temperature_source=("Open-Meteo 16-day forecast" if forecast else str(row["temp_source"])),
+                forecast_avg_temp=round(forecast["avg_temp"], 1) if forecast else None,
+                forecast_precipitation_probability_max=forecast["precipitation_probability_max"] if forecast else None,
+                forecast_weather_code=forecast["weather_code"] if forecast else None,
             ))
 
     return RecommendResponse(
@@ -434,6 +648,13 @@ def recommend(req: RecommendRequest):
                                 f"that best match your ratings and temperature."),
         preferred_temperature=req.temperature,
         region_applied=pretty(region_applied) if region_applied else None,
+        travel_month=month,
+        travel_month_name=MONTH_NAMES[month - 1] if month else None,
+        travel_start_date=req.travel_start_date,
+        travel_end_date=req.travel_end_date,
+        weather_source=weather_source,
+        forecast_candidates_evaluated=forecast_candidates_evaluated,
+        climate_source=CLIMATE_LABEL,
         notes=notes,
         count=len(results),
         results=results,

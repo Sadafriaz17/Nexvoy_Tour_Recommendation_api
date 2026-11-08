@@ -6,3 +6,6 @@ __pycache__
 README.md
 nexvoy_cli.py
 test_recommendations.py
+
+build_climate.py
+climate_usage.json
